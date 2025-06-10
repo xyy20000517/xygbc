@@ -1,0 +1,550 @@
+.libPaths(c('~/R/x86_64-pc-linux-gnu-library/4.4',
+            '/refdir/Rlib',
+            '/usr/local/lib/R/library'))
+library(Seurat) ## Attaching SeuratObject
+library(ggplot2)
+library(harmony) ## 载入需要的程辑包：Rcpp
+library(DoubletFinder)
+library(openxlsx)
+library(here) 
+library(dplyr) ## 载入程辑包：'dplyr'
+library(stringr)
+library(tibble)
+library(monocle) ## 载入需要的程辑包：Matrix
+library(cowplot) #
+gc()
+library(future)
+plan()
+# 设置多线程计划
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 10000* 1024^3) 
+# 读入数据
+dir = './20250320/' 
+samples = list.files( dir )
+samples 
+sceList = lapply(samples,function(pro){ 
+  # pro=samples[1] 
+  sce=CreateSeuratObject( Read10X(file.path(dir,pro)), 
+                          project = pro,
+                          min.cells = 5,
+                          min.features = 300 ) 
+  return(sce)
+}) 
+
+names(sceList) <- samples
+sce.all <- merge(
+  x = sceList[[1]],  # 第一个 Seurat 对象
+  y = sceList[-1],   # 其余的 Seurat 对象
+  add.cell.ids = samples  # 使用 samples 名称作为细胞前缀
+)
+
+head(sce.all@meta.data, 10) ## metadata overview
+table(sce.all$orig.ident) ## sample breakdown
+# 质控
+rnaAggr <- sce.all
+rnaAggr <- PercentageFeatureSet(rnaAggr, pattern = "^MT-", col.name = "percent.mt") # 线粒体比例
+rnaAggr <- PercentageFeatureSet(rnaAggr, pattern = "^RPL", col.name = "percent.rpl") # 核糖体蛋白L比例
+rnaAggr <- PercentageFeatureSet(rnaAggr, pattern = "^RPS", col.name = "percent.rps") # 核糖体蛋白S比例
+## 提取metadata
+metadata <- rnaAggr@meta.data 
+metadata$orig.ident <- factor(metadata$orig.ident, levels = unique(metadata$orig.ident))
+rnaAggr@meta.data <- metadata
+orig.ident <- levels(unique(rnaAggr$orig.ident))
+p1 <- VlnPlot(object = rnaAggr, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, group.by = "orig.ident")
+p2 <- VlnPlot(object = rnaAggr, features = c("percent.rps", "percent.rpl"), ncol = 2, group.by = "orig.ident", pt.size = 0)
+rnaAggr <- subset(rnaAggr, subset = nFeature_RNA > 200 & nFeature_RNA <6000 & percent.mt < 20 & nCount_RNA<50000)
+p1/p2
+saveRDS(rnaAggr,"m1.rds")
+# 去除双细胞的函数
+FindDoublets <- function(library_id, seurat_aggregate) {
+  rnaAggr <- seurat_aggregate
+  seurat_obj <- subset(rnaAggr, idents = library_id)  # 根据 orig.ident 提取特定样本
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  seurat_obj <- RunPCA(seurat_obj)
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:20)
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:20)
+  DimPlot(seurat_obj)
+  
+  # pK Identification (no ground-truth)
+  sweep.res.list_kidney <- paramSweep_v3(seurat_obj, PCs = 1:20, sct = F)
+  sweep.stats_kidney <- summarizeSweep(sweep.res.list_kidney, GT = FALSE)
+  bcmvn_kidney <- find.pK(sweep.stats_kidney)
+  pK <- bcmvn_kidney %>% 
+    filter(BCmetric == max(BCmetric)) %>% 
+    select(pK) 
+  pK <- as.numeric(as.character(pK[[1]]))
+  
+  
+  seurat_doublets <- doubletFinder_v3(seurat_obj, PCs = 1:20, pN = 0.25, pK = pK,
+                                      nExp = round(0.05 * length(seurat_obj@active.ident)), 
+                                      reuse.pANN = FALSE, sct = F)
+  
+  DF.class <- names(seurat_doublets@meta.data) %>% str_subset("DF.classifications")
+  pANN <- names(seurat_doublets@meta.data) %>% str_subset("pANN")
+  
+  p1 <- ggplot(bcmvn_kidney, aes(x = pK, y = BCmetric)) +
+    geom_bar(stat = "identity") + 
+    ggtitle(paste0("pKmax=", pK)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  p2 <- DimPlot(seurat_doublets, group.by = DF.class)
+  p3 <- FeaturePlot(seurat_doublets, features = pANN)
+  
+  df_doublet_barcodes <- as.data.frame(cbind(rownames(seurat_doublets@meta.data), seurat_doublets@meta.data[[DF.class]]))
+  return(df_doublet_barcodes)
+}
+rnaAggr<-arrRNA
+library_ids <- unique(rnaAggr$orig.ident)
+# 使用 lapply 遍历每个 orig.ident 值，调用 FindDoublets 函数
+orig.ident <- levels(unique(rnaAggr$orig.ident))
+list.doublet.bc <- lapply(orig.ident, function(x) {FindDoublets(x, seurat_aggregate = rnaAggr)})
+saveRDS(list.doublet.bc, "temp/list.doublet.bc.rds")
+list.doublet.bc <- readRDS('temp/list.doublet.bc.rds')
+doublet_id <- list.doublet.bc %>% 
+  bind_rows() %>% 
+  dplyr::rename("doublet_id" = "V2") %>% 
+  tibble::column_to_rownames(var = "V1") 
+
+table(doublet_id) 
+rnaAggr <- AddMetaData(rnaAggr, doublet_id)
+Idents(rnaAggr) <- "doublet_id"
+rnaAggr <- subset(rnaAggr, idents = "Singlet")
+saveRDS(rnaAggr, "rnaAggr_singlet.rds")
+M2<-rnaAggr
+gc()
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+M2 <- CellCycleScoring(M2, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+M2<-NormalizeData(M2,verbose = T) 
+M2<-FindVariableFeatures(M2,selection.method = "vst", nfeatures = 2000)
+M2<-ScaleData(M2,vars.to.regress = c("percent.mt","S.Score","G2M.Score"),verbose = FALSE)
+M2<-RunPCA(M2,verbose = T,npcs = 30)
+ElbowPlot(M2,ndims = 30)
+p1 <- DimPlot(object = M2, reduction = "pca", pt.size = .1, group.by = "orig.ident",raster=FALSE)
+p2 <- VlnPlot(object =M2, features = "PC_1", group.by = "orig.ident", pt.size = .1)
+p1|p2
+M2<-RunHarmony(M2,group.by.vars = c("orig.ident"), plot_convergence = TRUE)
+p3 <- DimPlot(object = M2, reduction = "harmony", pt.size = .1, group.by = "orig.ident",raster=FALSE)
+p4 <- VlnPlot(object = M2, features = "harmony_1", group.by = "orig.ident", pt.size = .1)
+p3/p4
+p1/p3
+M2 <- M2 %>% 
+  RunUMAP(reduction = "harmony", dims = 1:20) %>% 
+  RunTSNE(reduction = "harmony", dims = 1:20) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:20)
+set.seed(123)
+M2<- FindClusters(M2, resolution = 0.8)
+library(paletteer)
+palette <- c(paletteer_d("ggsci::category20_d3"),paletteer_d("ggsci::category20b_d3"),paletteer_d("ggsci::category20c_d3"))
+DimPlot(M2, raster = TRUE, cols = palette, label = FALSE) 
+saveRDS(M2,"./temp/M2.rds")
+clusterCols <- c("#843C39", "#8C6D31", "#E6550D", "#3182BD", "#54990F",
+                 "#BD9E39", "#E7BA52", "#31A354", "#E41A1C", "#6BAED6",
+                 "#9ECAE1", "#AD494A", "#A1D99B", "#C7E9C0", "#99600F",
+                 "#C3BC3F", "#D6616B", "#FF7F00", "#1B9E77", "#FDAE6B",
+                 "#66A61E", "#F1788D", "#E6550D", "#E7969C")
+
+DimPlot(M2, reduction = "umap", pt.size=0.05, raster=F,label = T) 
+mmdeg<-FindMarkers(M3,ident.1 = "mEPC",ident.2 = "nEPC")
+harmony.top19markers <-mmdeg %>% group_by(cluster) %>% top_n(n = 19,wt = avg_log2FC )
+harmony.top50markers <- mmdeg%>% group_by(cluster) %>% top_n(n = 50,wt = avg_log2FC )
+write.csv(harmony.top50markers,"deg.csv")
+
+M2 <- RenameIdents(M3, 
+                   `0` = "T_cell",
+                   `5` = "T_cell",
+                   `2` = "Epithelial_cell",
+                   `6` = "Epithelial_cell",
+                   `17` = "Epithelial_cell",
+                   `4` = "MT",
+                   `1` = "Mesenchymal_cell",
+                   `7` = "Mesenchymal_cell",
+                   `8` = "Mesenchymal_cell",
+                   `9` = "Endothelial_cell",
+                   `12` = "Endothelial_cell",
+                   `10` = "B_cell",
+                   `13` = "Mast_cell", 
+                   `18` = "unknown",
+                   `14` = "PlasmaB_cell",
+                   `15` = "unknown",
+                   `16`="Proliferating_cell",
+                   `3` = "Myeloid_cell",
+                   `11`="Myeloid_cell"
+                  
+)
+##去掉不需要的两群
+phe<-M3@meta.data
+# 更新元数据
+M3@meta.data <- M3@meta.data %>%
+  mutate(celltypehand = Idents(M3),
+         celltypebig = case_when(
+           celltypehand %in% c("T_cell", "B_cell", "PlasmaB_cell", "Myeloid_cell", "Mast_cell") ~ "Immune_cell",
+           celltypehand %in% c("Endothelial_cell", "Mesenchymal_cell") ~ "Stromal_cell",
+           celltypehand == "Epithelial_cell" ~ "Epithelial_cell",
+           celltypehand %in% c("Proliferating_cell") ~ "Proliferating_cell"
+         ))
+
+# 更新Seurat对象的元数据
+
+M3@meta.data<-  M3@meta.data %>%
+  mutate(group= case_when(
+    substr(orig.ident, 1, 3) == "CCS" ~ "normal",
+    substr(orig.ident, 1, 3) == "GBA" ~ "normal",
+    substr(orig.ident, 1, 3) == "GBC" ~ "cancer",
+    
+  ))
+M3@meta.data<-  M3@meta.data %>%
+  mutate(disease= case_when(
+    substr(orig.ident, 1, 3) == "CCS" ~ "CCS",
+    substr(orig.ident, 1, 3) == "GBA" ~ "GBA",
+    substr(orig.ident, 1, 3) == "GBC" ~ "GBC",
+    
+  ))
+
+
+phe$disease<-factor(phe$disease,levels = c('CCS','GBA',"GBC"))
+phe$celltypehand<-factor(phe$celltypehand,levels = c("Epithelial_cell","T_cell","B_cell","PlasmaB_cell","Myeloid_cell","Endothelial_cell","Mesenchymal_cell","Mast_cell","Proliferating_cell"))
+phe$celltypebig<-factor(phe$celltypebig,levels = c("Epithelial_cell","Immune_cell", "Stromal_cell","Proliferating_cell"))
+M3@meta.data<-phe
+M3<-M2[,Idents(M2)%in%c("Epithelial_cell","T_cell","B_cell","PlasmaB_cell","Myeloid_cell","Endothelial_cell","Mesenchymal_cell","Mast_cell","Proliferating_cell"
+)]
+##标记基因
+library(ComplexHeatmap)
+library(circlize)
+# 定义颜色向量
+corsgroup<-c("grey","#D62728FF")
+corsorigient <- c("#1F77B4FF", "#FF7F0EFF", "#2CA02CFF", "#D62728FF", "#9467BDFF", "#8C564BFF", "#E377C2FF", "#BCBD22FF", "#17BECFFF", "#AEC7E8FF","#FFBB78FF")
+
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(Seurat)
+library(ComplexHeatmap)
+library(circlize)
+saveRDS(M2,"M2.rds")
+library(ggplot2)
+cell_type_order <- c("Epithelial_cell", "T_cell", "B_cell", 
+                     "PlasmaB_cell", "Myeloid_cell", 
+                     "Endothelial_cels", "Mesenchymal_cell", 
+                     "Mast_cell", "Proliferating_cell")
+
+# 将 Seurat 对象中的细胞类型设置为因子，并指定顺序
+M3$celltypehand<- factor(M3$celltypehand, levels = cell_type_order)
+list_genes=list(Epithelial_cell=c("EPCAM","KRT8","FXYD3","TFF3"),
+                T_cell = c("CD3G","CD3D","CD3E"),
+                B_cell = c("CD79A", "CD79B","MS4A1"),
+                PlasmaB_cell=c("IGLC2","IGKC","JCHAIN","MZB1"),
+                Myeloid_cell=c("CD14","CD68", "C1QA","APOC1"),
+                Endothelial_cell=c("PLVAP","PECAM1","VWF"),
+                Mesenchymal_cell=c("DCN","LUM","COL1A2","ACTA2","RGS5"),
+                Mast_cell=c("TPSB2","CPA3", "KIT"),
+                Proliferating_cell=c("MKI67","STMN1","TOP2A")
+)
+
+
+p1=DotPlot(M3,
+           features=list_genes,
+           cols = c("grey", "red"),
+           cluster.idents = T)+
+  RotatedAxis()+
+  theme(
+    # 面板
+    panel.border = element_rect(color="black"), #面板边框
+    panel.spacing = unit(1, "mm"), #面板间距
+    
+    # 分面标题
+    #strip.background = element_rect(color="red"),
+    strip.text = element_text(margin=margin(b=3, unit="mm")),
+    strip.placement = 'outlet', #
+    
+    # 坐标轴线
+    axis.line = element_blank(),
+  )+labs(x="", y="")
+p1
+library(Seurat)
+library(ggplot2)
+table(phe$mm)
+p1 = DotPlot(M3,
+             features = list_genes,
+             cols = c("grey", "red"),
+             cluster.idents = T) +
+  RotatedAxis() +
+  theme(
+    # 面板
+    panel.border = element_rect(color = "black"), #面板边框
+    panel.spacing = unit(1, "mm"), #面板间距
+    
+    # 分面标题
+    strip.text = element_text(margin = margin(b = 3, unit = "mm")),
+    strip.placement = 'outlet', 
+    
+    # 坐标轴线
+    axis.line = element_blank()
+  ) +
+  labs(x = "", y = "") +
+  
+  # 设置颜色范围使得点的颜色反映在 0 到 2 之间的平均表达量
+  scale_color_gradient(limits = c(0, 2), low = "grey", high = "red")
+
+p1
+
+M3<-SetIdent(M3,value="celltypehand")
+phe<-mac2@meta.data
+tab<-table(phe$celltypehand,phe$orig.ident)
+table(phe$celltypehand)
+tab<-prop.table(tab,2)*100
+tab
+tab<-as.data.frame(tab)
+tab
+tab <- tab[tab$Freq !=0, ]
+group <- c(rep("CCS", 18), rep("GBA", 18),rep("GBC",18))
+group <- c(rep("normal", 18), rep("cancer", 9))
+tab$group<-group
+library(ggplot2)
+library(ggalluvial)
+library(tidyverse)
+library(cols4all)
+pp <- ggplot(tab, aes(x=Var2, y=Freq, fill=Var1,
+                      stratum =Var1, alluvium = Var1)) +
+  scale_fill_manual(values = palette) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic()
+p1 <- pp +
+  geom_col(width = 0.6, color = NA) +
+  geom_flow(width = 0.6, alpha = 0.22, knot.pos = 0) #knot.pos控制连线的曲直，等于0时为直线连线；
+p1
+dev.off()
+p2 <- pp +
+  geom_col(width = 0.6,
+           color = 'white', size = 0.5) + #同时赋予白色描边，适当加粗
+  geom_flow(width = 0.6, alpha = 0.22, knot.pos = 0,
+            color = 'white', size = 0.5) #同时赋予白色描边，适当加粗
+p2
+#曲线连线效果：
+p3 <- pp +
+  geom_col(width = 0.6,
+           color = 'white', size = 0.5) +
+  geom_flow(width = 0.6, alpha = 0.22, knot.pos = 0.4,
+            color = 'white', size = 0.5)
+p3
+p4 <- pp +
+  geom_col(width = 0.6,
+           color = NA, size = 0.5) + #去掉柱子的描边
+  geom_flow(width = 0.6, alpha = 0.22, knot.pos = 0.35,
+            color = 'white', size = 0.5) +
+  geom_alluvium(width = 0.6, alpha = 1, knot.pos = 0.35,
+                fill = NA, color = 'white', size = 0.5) #再叠加一层白色描边加强一下效果
+p4
+p <- ggplot(tab, aes(x = 3, #给一个数值向量作为柱子x轴的中心坐标
+                     y = Freq,
+                     fill = Var1)) + #将颜色映射到celltype
+  geom_col(width = 1.5, #柱形图柱子宽度
+           color = 'white') + #描边颜色
+  facet_grid(.~Var2) + #按tissue分面
+  scale_fill_manual(values =cors) 
+p
+p1 <- p + coord_polar(theta = "y")
+p1
+#甜甜圈图：将饼图中心“挖空”；
+p2 <- p1 + xlim(c(0.2, 3.8))
+p2
+
+p3 <- p2 +
+  scale_fill_manual(values = cors) +
+  theme_void()+ #空白主题
+  theme(
+    strip.text.x = element_text(size = 14), #分面标签大小
+    legend.title = element_text(size = 15), #图例标题大小调整
+    legend.text = element_text(size = 14) #图例标签大小调整
+  )
+p3
+p3 <- p + 
+  coord_polar(theta = "y") +    # 保留饼图的极坐标
+  scale_fill_manual(values = cors) +  # 设置颜色
+  theme_void() +  # 空白主题
+  theme(
+    strip.text.x = element_text(size = 14),  # 分面标签大小
+    legend.title = element_text(size = 15),  # 图例标题大小调整
+    legend.text = element_text(size = 14)    # 图例标签大小调整
+  )
+
+# 显示最终的饼图
+p3
+p3 <- p + 
+  coord_polar(theta = "y") +    # 保留饼图的极坐标
+  scale_fill_manual(values = cors) +  # 设置颜色
+  theme_void() +  # 空白主题
+  theme(
+    strip.text.x = element_text(size = 14),  # 分面标签大小
+    legend.title = element_text(size = 6),  # 图例标题大小调整
+    legend.text = element_text(size = 6),   # 图例标签大小调整
+    legend.position = "bottom",              # 将图例放在饼图下方
+    legend.direction = "horizontal"          # 图例按水平排列
+  )
+
+# 显示最终的饼图
+p3
+
+#倒过来的图
+ggplot2::ggplot(tab,aes(x=Var2, y=Freq, fill=Var1))+
+  geom_bar(stat="identity",position = "stack")+
+  theme_bw()+coord_flip()+
+  scale_fill_manual(values = cors)+
+  ylab("Cell number")+xlab("")
+
+
+
+
+# 加载必要的包
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+# 加载必要的包
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+
+# 提取 meta.data
+meta_data <- macro@meta.data  # 假设 Seurat 对象为 macro
+
+# 计算每个疾病组的总细胞数
+total_cells_per_disease <- meta_data %>%
+  group_by(disease) %>%
+  summarise(Total = n())
+
+# 计算每种细胞类型在每个疾病组中的数量
+data_summary <- meta_data %>%
+  group_by(disease, small) %>%
+  summarise(Count = n()) %>%
+  left_join(total_cells_per_disease, by = "disease") %>%  # 合并总细胞数
+  mutate(
+    Proportion = Count / Total,                            # 计算比例
+    SE = sqrt((Proportion * (1 - Proportion)) / Total),    # 计算标准误
+    Lower = Proportion - 1.96 * SE,                        # 计算置信区间下限 (95%)
+    Upper = Proportion + 1.96 * SE                         # 计算置信区间上限 (95%)
+  ) %>%
+  ungroup()
+
+# 确保置信区间在 0 和 1 之间
+data_summary <- data_summary %>%
+  mutate(
+    Lower = pmax(Lower, 0), 
+    Upper = pmin(Upper, 1)
+  )
+
+# 查看处理后的数据
+print(data_summary)
+macro$small3<-Idents(macro)
+# 查看处理后的数据
+print(data_summary)
+
+# 绘制比例折线图
+# 绘制比例折线图
+ggplot(data_summary, aes(x = disease, y = Proportion, group = small, color = small, fill = small)) +
+  geom_line(size = 1) +  # 绘制折线
+  geom_point(size = 2) +  # 绘制点
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, color = NA) +  # 绘制置信区间
+  facet_wrap(~ small, scales = "free_y", nrow = 1) +  # 每个细胞类型一个子图
+  theme_minimal() +  # 简洁主题
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1), # 为每个子图添加边框
+    panel.grid = element_blank(),        # 去掉背景网格线
+    axis.text.x = element_text(angle = 45, hjust = 1),  # X轴标签倾斜
+    strip.text = element_text(size = 10, face = "bold"), # 小标题样式
+    panel.spacing = unit(1, "lines")  # 调整子图间距
+  ) +
+  labs(
+    x = NULL,  # X轴标签为空
+    y = "Proportion of Cells"  # Y轴标签
+   
+  ) +
+  scale_color_manual(values = cors) +  # 使用自定义颜色
+  scale_fill_manual(values = cors)    # 使用自定义颜色填充
+
+M3<-M2[,Idents(M2)%in%c("Epithelial_cell","T_cell","B_cell","PlasmaB_cell","Myeloid_cell","Endothelial_cell","Mesenchymal_cell","Mast_cell","EMT_DB","Proliferating_cell")] 
+
+# 进行 Kruskal-Wallis 检验
+kruskal_results <- tab %>%
+  group_by(Var1) %>%
+  summarise(p_value = kruskal.test(Freq ~ group)$p.value)
+
+# 查看 Kruskal-Wallis 结果
+pairwise_results <- pairwise.wilcox.test(tab$Freq, tab$group, p.adjust.method = "bonferroni")
+
+# 查看成对检验结果
+print(pairwise_results)
+# 查看成对检验结果
+print(pairwise_results)
+# 定义颜色
+corsdisease<-c("#1A5592",  "#B83D3D")
+ann_colors <- c("CCS" = "#1A5592", "GBA" ="#FFD700", "GBC" ="#B83D3D")
+coscnv<-c( "#1A5592","#FFD700","#B83D3D")
+# 绘制箱线图
+ggplot(tab, aes(x = group, y = Freq, color = group)) +
+  geom_boxplot(outlier.shape = NA, fill = NA, size = 0.8) + # 设置箱体透明，边框颜色根据 group 变化
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 2) + # 添加散点图
+  facet_wrap(~ Var1, scales = "free") +
+  theme_minimal(base_size = 15) + # 使用最小主题
+  theme(
+    panel.grid.major = element_blank(), # 去除主背景线
+    panel.grid.minor = element_blank(), # 去除次背景线
+    panel.border = element_blank(), # 去除面板边框
+    strip.background = element_blank(), # 去除分面背景
+    strip.text = element_text(size = 8), # 设置分面标签字体大小
+    axis.line = element_line(color = "black"), # 添加轴线
+    axis.text = element_text(color = "black"), # 设置轴文本颜色
+    axis.title = element_text(color = "black") # 设置轴标题颜色
+  ) +
+  scale_color_manual(values = coscnv) + # 自定义边框颜色
+  labs(
+    x = "Disease", y = "Proportion")
+ggplot(tab, aes(x = group, y = Freq, color = group)) +
+  geom_boxplot(outlier.shape = NA, fill = NA, size = 0.8) +  # 箱线图
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 2) +  # 散点图
+  facet_wrap(~ Var1, scales = "free") +
+  theme_minimal(base_size = 15) +  # 使用最小主题
+  theme(
+    panel.grid.major = element_blank(),  # 去除主背景线
+    panel.grid.minor = element_blank(),  # 去除次背景线
+    panel.border = element_blank(),      # 去除面板边框
+    strip.background = element_blank(),    # 去除分面背景
+    strip.text = element_text(size = 8),    # 设置分面标签字体大小
+    axis.line = element_line(color = "black"),   # 添加轴线
+    axis.text = element_text(color = "black"),     # 设置轴文本颜色
+    axis.title = element_text(color = "black"),    # 设置轴标题颜色
+    legend.text = element_text(size = 8)          # 修改 legend 字体变小
+  ) +
+  scale_color_manual(values = ann_colors) +  # 自定义边框颜色
+  labs(x = "Disease", y = "Proportion")
+
+
+# 定义要比较的疾病组对
+group_pairs <- list( c("CCS", "GBC"), c("GBA", "GBC"),c('CCS',"GBA"))
+group_pairs <- list("normal","cancer")
+# 初始化一个空的数据框来存储结果
+results <- data.frame()
+dev.off()
+# 对每种细胞类型进行迭代
+for(cell_type in unique(tab$Var1)) {
+  # 筛选当前细胞类型的数据
+  subdata <- tab[tab$Var1 == cell_type,]
+  
+  # 进行每对疾病组的比较
+  for(pair in group_pairs) {
+    group1_data <- subdata[subdata$group == pair[1],]
+    group2_data <- subdata[subdata$group == pair[2],]
+    
+    if(nrow(group1_data) > 0 & nrow(group2_data) > 0) {
+      test_result <-wilcox.test(group1_data$Freq, group2_data$Freq, exact = FALSE)#wilcox.test
+      
+      # 将结果添加到结果数据框
+      results <- rbind(results, data.frame(CellType = cell_type,
+                                           Group1 = pair[1],
+                                           Group2 = pair[2],
+                                           W = test_result$statistic,
+                                           PValue = test_result$p.value))
+    }
+  }
+}

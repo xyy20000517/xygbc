@@ -1,0 +1,181 @@
+#fig2
+# fig2a_umap_epi_clusters.R
+library(Seurat)
+library(harmony)
+epi <- CellCycleScoring(epi, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+epi <- NormalizeData(epi) %>%
+  FindVariableFeatures(nfeatures = 2000) %>%
+  ScaleData(vars.to.regress = c("percent.mt", "S.Score", "G2M.Score")) %>%
+  RunPCA(npcs = 20)
+epi <- RunHarmony(epi, group.by.vars = c("orig.ident"))
+epi <- RunUMAP(epi, reduction = "harmony", dims = 1:12) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:12) %>%
+  FindClusters(resolution = 0.5)
+
+epi <- RenameIdents(epi,
+                    "0" = "MOGAT1+EpiC0",
+                    "1" = "EDN1+EpiC1",
+                    "2" = "VIM+EpiC2",
+                    "3" = "SPP1-CCL20+EpiC3",
+                    "4" = "SPP1+CCL20+EpiC4",
+                    "5" = "MGAM2-MT1G+EpiC5",
+                    "6" = "MGAM2+SYNE2+EpiC6",
+                    "7" = "IGHC+CEACAM5+EpiC7",
+                    "8" = "IGHC-CEACAM5+EpiC8"
+)
+
+palette <-c("#96C3D8","#F5B375","#C0937E","#67A59B","#A5D38F","#8D75AF","#F19294","#E45D61","#BDA7CB")
+epi3$small <- Idents(epi3)
+ggsave("plots/fig2a_umap_epi_clusters.png",
+       DimPlot(epi3, reduction = "umap", cols = palette, pt.size = 0.25),
+       width = 6, height = 5, dpi = 300)
+
+# fig2b_dotplot_epi_markers.R
+library(Seurat)
+library(ggplot2)
+markers <- c(
+  "DACH1", "CASR", "MOGAT1", "CTNND2", "RALYL", "PKHD1", "MUC5B",
+  "GC", "PIGR", "EDN1", "GSTA1", "LGALS2", "LUM", "DCN", "VIM", "TPSB2",
+  "MGP", "IGFBP7", "FGF19", "DUOX2", "TFF1", "SAA1", "TXNRD1", "CCL20",
+  "AKR1B10", "AKR1C1", "KRT20", "SPP1", "SPINK1", "CLDN18", "SYNE2",
+  "ANXA10", "MT2A", "MT1G", "MGAM2", "CXCL10", "IGLC2", "IGHG4",
+  "CEACAM6", "CEACAM5", "CDKN2A")
+p2b <- DotPlot(epi, features = markers, dot.scale = 8, scale = TRUE) +
+  scale_color_gradientn(colors = c("#313695", "#4575B4", "#91BFDB", "#E0F3F8", 
+                                   "#FEE090", "#FC8D59", "#D73027", "#A50026"),
+                        name = "Avg. Expression") +
+  RotatedAxis() +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 10, face = "bold"),
+    axis.text.y = element_text(size = 10, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(color = "black")
+  ) +
+  guides(size = guide_legend(order = 1), color = guide_colorbar(order = 2))
+
+ggsave("plots/fig2b_dotplot_epi_markers.png", p2b, width = 12, height = 6)
+
+#fig2c_barplot_epi_distribution.R
+library(ggalluvial)
+library(ggplot2)
+library(cols4all)
+tab <- table(phe$small, phe$orig.ident)
+tab <- prop.table(tab, 2) * 100
+tab <- as.data.frame(tab)
+tab <- tab[tab$Freq != 0, ]
+palette <- cols4all::c4a('pastel', 10)
+fig2c <- ggplot(tab, aes(x = Var2, y = Freq, fill = Var1,
+                         stratum = Var1, alluvium = Var1)) +
+  geom_col(width = 0.6, color = NA) +
+  geom_flow(width = 0.6, alpha = 0.22, knot.pos = 0) +
+  scale_fill_manual(values = palette) +
+  theme_classic() + ylab("Proportion") + xlab("Subtype")
+ggsave("plots/fig2c_alluvial_epi_distribution.png", fig2c, width = 8, height = 5)
+
+#fig2d_pie_epi_subtypes.R
+library(ggplot2)
+palette <- cols4all::c4a("pastel", 10)
+tab <- table(phe$disease, phe$small)
+tab_df <- as.data.frame(tab)
+colnames(tab_df) <- c("Disease", "Subtype", "Count")
+tab_df <- tab_df[tab_df$Count > 0, ]
+tab_df$Subtype <- factor(tab_df$Subtype, levels = unique(tab_df$Subtype))
+fig2d <- ggplot(tab_df, aes(x = "", y = Count, fill = Subtype)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  facet_wrap(~Disease, nrow = 1) +
+  scale_fill_manual(values = palette) +
+  theme_void() +
+  theme(strip.text = element_text(size = 12))
+ggsave("plots/fig2d_pie_epi_subtypes.png", fig2d, width = 10, height = 4)
+
+# fig2e_bubble_GO_enrichment_clusterProfiler.R
+library(ggpubr)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(stats)
+library(data.table)
+library(dplyr)
+gene.df <- bitr(DEG_data$gene, fromType = "SYMBOL", toType = c("ENTREZID", "SYMBOL"), OrgDb = org.Hs.eg.db)
+colnames(gene.df)[1] <- "gene"
+DEG_data <- left_join(gene.df, DEG_data, by = "gene")
+GO <- compareCluster(ENTREZID ~ cluster, data = DEG_data, fun = enrichGO, OrgDb = org.Hs.eg.db)
+G1 <- as.data.frame(GO)
+write.csv(G1, "GO_enrichment_by_cluster.csv")
+p <- dotplot(GO) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    panel.spacing = unit(5, "mm"),
+    strip.text.y = element_text(size = 12, face = "bold"),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8)
+  ) +
+  scale_colour_gradientn(colours = c("#E54924", "#498EA4")) +
+  labs(
+    x = "Pathway",
+    y = "Gene Ratio",
+    color = expression(-log10(p.adjust)),
+    title = "GO Enrichment Analysis"
+  )
+ggsave("plots/fig2e_bubble_go_enrichment.png", p, width = 10, height = 6)
+
+# fig2f_boxplot_cna_value.R
+ggplot(phe, aes(x = small, y = CNA_value, fill = small)) +
+  geom_boxplot() +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  ) +
+  scale_fill_manual(values = cors)
+
+#fig2h_pseudotime_layers.R
+library(monocle)
+library(ggplot2)
+library(ggsci)
+p1 <- plot_cell_trajectory(cds, color_by = "Pseudotime") +
+  scale_color_gradient(low = "#C6DBEF", high = "#08306B") +
+  theme_void() +
+  ggtitle("")
+p2 <- plot_cell_trajectory(cds, color_by = "small") +
+  scale_color_manual(values = palette) +
+  theme_void() +
+  ggtitle("")
+p3 <- plot_cell_trajectory(cds, color_by = "disease") +
+  scale_color_manual(values = c(CCS = "#1f78b4", GBA = "#ffcc00", GBC = "#b2182b")) +
+  theme_void() +
+  ggtitle("")
+p4 <- plot_cell_trajectory(cds, color_by = "cnv_class") +
+  scale_color_manual(values = c(low = "#66c2a5", median = "#fc8d62", high = "#d53e4f")) +
+  theme_void() +
+  ggtitle("")
+pData(cds)$CEACAM5 <- log2(exprs(cds)["CEACAM5", ] + 1)
+
+p5 <- plot_cell_trajectory(cds, color_by = "CEACAM5") +
+  scale_color_gradientn(colors = rev(brewer.pal(9, "PuBu"))) +
+  theme_void() +
+  ggtitle("")
+
+#fig.2i
+my_genes<-c("PIGR","MUC5B","DACH1","GC","MOGAT1","VIM","LUM","DCN","SAA1","TXNRD1","CCL20","AKR1B10","CEACAM6","TFF2","DUOX2","FGF19","SPP1","CDKN2A","CEACAM5")
+pht <- plot_pseudotime_heatmap(cds[top6, ],
+                               num_clusters = 4,  
+                               cores = 1,
+                               show_rownames = TRUE,
+                               return_heatmap = TRUE, 
+                               hmcols = colorRampPalette(c("navy", "white", "firebrick3"))(100)
+)
+pht

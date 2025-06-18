@@ -1,0 +1,78 @@
+#fig1
+# fig1b_umap_celltypes.R
+library(Seurat)
+library(ggplot2)
+clusterCols <- c("#843C39", "#8C6D31", "#E6550D", "#3182BD", "#54990F", "#BD9E39", "#E7BA52", "#E41A1C", "#6BAED6")
+names(clusterCols) <- c("Epithelial_cell","T_cell","B_cell","PlasmaB_cell","Myeloid_cell","Endothelial_cell","Mesenchymal_cell","Mast_cell","Proliferating_cell")
+fig1b <- DimPlot(M3, reduction = "umap", group.by = "celltypehand", cols = clusterCols, raster = FALSE)
+ggsave("plots/fig1b_umap_celltypes.png", fig1b, width = 6, height = 5)
+
+# fig1c_heatmap_roleindex.R
+library(ComplexHeatmap)
+library(circlize)
+library(sscVis)
+# Roe 计算
+meta_data <- M3@meta.data
+meta_data$tissue <- meta_data$disease
+Roe <- calTissueDist(meta_data,
+                     byPatient = FALSE,
+                     colname.cluster = "celltypehand",
+                     colname.patient = "orig.ident",
+                     colname.tissue = "tissue",
+                     method = "chisq",
+                     min.rowSum = 0)
+# 绘图
+col_fun <- colorRamp2(c(min(Roe, na.rm = TRUE), 1, max(Roe, na.rm = TRUE)),
+                      c("#1F77B4FF", "white", "#D62728FF"))
+Heatmap(as.matrix(Roe),
+        name = "Ro/e Index",
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        row_names_side = 'right',
+        col = col_fun,
+        heatmap_legend_param = list(title = "Ro/e Index",
+                                    at = seq(0.5, 1.5, by = 0.5),
+                                    labels = seq(0.5, 1.5, by = 0.5)),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%.2f", Roe[i, j]), x, y, gp = gpar(fontsize = 8, col = "black"))
+        })
+ggsave("plots/fig1c_heatmap_roleindex.png", width = 6, height = 5)
+
+# fig1d_dotplot_markers.R
+library(Seurat)
+list_genes <- list(Epithelial_cell=c("EPCAM","KRT8","FXYD3","TFF3"),
+                   T_cell = c("CD3G","CD3D","CD3E"),
+                   B_cell = c("CD79A", "CD79B","MS4A1"),
+                   PlasmaB_cell=c("IGLC2","IGKC","JCHAIN","MZB1"),
+                   Myeloid_cell=c("CD14","CD68", "C1QA","APOC1"),
+                   Endothelial_cell=c("PLVAP","PECAM1","VWF"),
+                   Mesenchymal_cell=c("DCN","LUM","COL1A2","ACTA2","RGS5"),
+                   Mast_cell=c("TPSB2","CPA3", "KIT"),
+                   Proliferating_cell=c("MKI67","STMN1","TOP2A"))
+p1 <- DotPlot(M3, features = list_genes, cluster.idents = TRUE, cols = c("grey", "red")) +
+  RotatedAxis() + scale_color_gradient(limits = c(0,2), low="grey", high="red") + theme_minimal()
+ggsave("plots/fig1d_dotplot_markers.png", p1, width = 8, height = 5)
+
+# fig1e_barplot_composition.R
+library(ggplot2)
+tab <- table(M3$orig.ident, M3$celltypehand)
+tab <- prop.table(tab, 1)
+tab_df <- as.data.frame(tab)
+colnames(tab_df) <- c("Sample", "CellType", "Proportion")
+fig1e <- ggplot(tab_df, aes(x = Sample, y = Proportion, fill = CellType)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = clusterCols) +
+  theme_classic() + ylab("Proportion") + xlab("Sample")
+ggsave("plots/fig1e_barplot_composition.png", fig1e, width = 8, height = 4)
+
+# fig1f_barplot_cellcycle.R
+library(ggplot2)
+tab <- table(M3$orig.ident, M3$Phase)
+tab <- prop.table(tab, 1)
+tab_df <- as.data.frame(tab)
+colnames(tab_df) <- c("Sample", "Phase", "Proportion")
+fig1f <- ggplot(tab_df, aes(x = Sample, y = Proportion, fill = Phase)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c(G1="#843C39", S="#8C6D31", G2M="#E6550D")) +
+  theme_minimal() + ylab("Proportion") + xlab("Sample")
+ggsave("plots/fig1f_barplot_cellcycle.png", fig1f, width = 8, height = 4)

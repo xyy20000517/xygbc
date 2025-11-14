@@ -1,0 +1,112 @@
+#Fig.3
+#Fig.3A
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+TCELL <- CellCycleScoring(TCELL, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+TCELL<-NormalizeData(TCELL,verbose = T) 
+TCELL<-FindVariableFeatures(TCELL,selection.method = "vst", nfeatures = 2000)
+TCELL<-ScaleData(TCELL,vars.to.regress = c("percent.mt","S.Score","G2M.Score"),verbose = FALSE)
+TCELL<-RunPCA(TCELL,verbose = T,npcs = 20)
+ElbowPlot(TCELL,ndims =20)
+p1 <- DimPlot(object = TCELL, reduction = "pca", pt.size = .1, group.by = "orig.ident",raster=FALSE)
+p2 <- VlnPlot(object =TCELL, features = "PC_1", group.by = "orig.ident", pt.size = .1)
+p1|p2
+TCELL<-RunHarmony(TCELL,group.by.vars = c("orig.ident"), plot_convergence = TRUE)
+p3 <- DimPlot(object = TCELL, reduction = "harmony", pt.size = .1, group.by = "orig.ident",raster=FALSE)
+p4 <- VlnPlot(object = TCELL, features = "harmony_1", group.by = "orig.ident", pt.size = .1)
+p3/p4
+p1/p3
+TCELL<- TCELL%>% 
+  RunUMAP(reduction = "harmony", dims = 1:12) %>% 
+  RunTSNE(reduction = "harmony", dims = 1:12) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:12)
+set.seed(123)
+TCELL<- FindClusters(TCELL, resolution = 0.5)
+library(paletteer)
+palette <- c(paletteer_d("ggsci::category20_d3"),paletteer_d("ggsci::category20b_d3"),paletteer_d("ggsci::category20c_d3"))
+Fig3A<-DimPlot(TCELL,raster =F,cols =clusterCols,label =F,pt.size = 0.25)
+
+#Fig.3B
+markers <- c("CD8A","CD8B","CD4","CD40LG","KLRG1","SLC4A10","KLRB1",'ZBTB16','RORA',"IL7R","CCL20","CCR6",'TCF7','SELL','LEF1',"PTEN","FAAH2","CXCL13","TOX","TOX2","FOXP3",'CTLA4',"TIGIT",'MYADM','CD69','ITGAE',"GPR183","PTGER4","MT1E","FTH1","CITED2","TOB1","CCL4","CCL5","KIF13B","KLRC2","THEMIS","GZMK","IFNG-AS1",'LYST',"GZMB","HAVCR2",'LAG3','PDCD1',"TOP2A","STMN1","MKI67","MT-ATP8","IGKC","HSPA1A","HSPA1B","FOSB",'FCGR3A','KLRD1','NKG7',"NCAM1")
+Fig3B <- DotPlot(TCELLZS, features = c("CCL5"), dot.scale = 8, scale = TRUE) +
+  scale_color_gradientn(colors = c("#313695", "#4575B4", "#91BFDB", "#E0F3F8", 
+                                   "#FEE090", "#FC8D59", "#D73027", "#A50026"),
+                        name = "Avg. Expression") +     RotatedAxis() +
+  theme_minimal() +
+    theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 10, face = "bold"), 
+    axis.text.y = element_text(size = 10, face = "bold"),                                 
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),                      
+    legend.title = element_text(size = 12, face = "bold"),                              
+    legend.text = element_text(size = 10),                                           
+    panel.grid.major = element_blank(),                                               
+    panel.grid.minor = element_blank(),                                              
+    panel.background = element_blank(),                                               
+    axis.line = element_line(color = "black")                                           
+  ) +
+  guides(size = guide_legend(order = 1), color = guide_colorbar(order = 2))
+Fig3B
+
+#Fig3D
+library(ComplexHeatmap)
+library(circlize)
+library(sscVis)
+meta_data <- TCELL@meta.data
+meta_data$tissue <- meta_data$disease
+Roe <- calTissueDist(meta_data,
+                     byPatient = FALSE,
+                     colname.cluster = "celltypehand",
+                     colname.patient = "orig.ident",
+                     colname.tissue = "tissue",
+                     method = "chisq",
+                     min.rowSum = 0)
+col_fun <- colorRamp2(c(min(Roe, na.rm = TRUE), 1, max(Roe, na.rm = TRUE)),
+                      c("#1F77B4FF", "white", "#D62728FF"))
+Heatmap(as.matrix(Roe),
+        name = "Ro/e Index",
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        row_names_side = 'right',
+        col = col_fun,
+        heatmap_legend_param = list(title = "Ro/e Index",
+                                    at = seq(0.5, 1.5, by = 0.5),
+                                    labels = seq(0.5, 1.5, by = 0.5)),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%.2f", Roe[i, j]), x, y, gp = gpar(fontsize = 8, col = "black"))
+        })
+
+
+
+#Fig3E
+gene_list <- list(
+  Naive = c("CCR7", "TCF7", "LEF1", "SELL"),
+  Cytotoxic = c("GZMK", "IFNG", "GZMH", "GNLY", "PRF1", "NKG7", "GZMA", "GZMB"),
+  Inhibitory = c("LAG3", "PDCD1", "CTLA4", "TIGIT", "BTLA", "HAVCR2"),
+  Treg = c("IL2RA", "FOXP3", "IKZF2"),
+  Proliferating = c("MKI67", "CDK1", "STMN1")
+)
+
+TCELL<- AddModuleScore(
+  object = TCELL,
+  features = gene_list,
+  name = "Module"  
+)
+module_cols <- grep("^Module", colnames(Tcell@meta.data), value = TRUE)
+new_names <- c("Naive_Score", "Cytotoxic_Score", "Inhibitory_Score", "Treg_Score", "Proliferating_Score")
+names(new_names) <- module_cols 
+colnames(TCELL@meta.data)[match(names(new_names), colnames(Tcell@meta.data))] <- new_names
+head(TCELL@meta.data[, c(new_names, "small", "group")])
+library(dplyr)
+module_scores <- TCELL@meta.data %>% 
+  dplyr::select(small, group, Naive_Score, Cytotoxic_Score, Inhibitory_Score, Treg_Score, Proliferating_Score)
+module_scores_summary <- module_scores %>% 
+  group_by(small, group) %>% 
+  summarise(across(everything(), mean, na.rm = TRUE)) %>% 
+  as.data.frame()
+module_scores_summary$Cell_group <- paste(module_scores_summary$small, module_scores_summary$group, sep = "-")
+head(module_scores_summary)
+module_scores_matrix <- module_scores_summary %>% 
+  dplyr::select(Naive_Score, Cytotoxic_Score, Inhibitory_Score, Treg_Score, Proliferating_Score) %>% 
+  as.matrix()
+rownames(module_scores_matrix) <- module_scores_summary$Cell_group
+module_scores_matrix_normalized <- scale(module_scores_matrix)

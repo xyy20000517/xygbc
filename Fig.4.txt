@@ -1,0 +1,123 @@
+#Fig.4
+#Fig.4A
+cors <- c(
+  "#B4D3E8",   "#1B73B2", 
+  "#FAC26B",   "#BED684",   "#319837",   "#F29C9E",   "#DB0D15"  )
+print(cor)
+Fig4A<-DimPlot(macrophages, reduction = "umap", cols=cors, pt.size=0.25, raster=F) 
+
+#Fig.4F
+library(Seurat)
+library(AUCell)
+library(scMetabolism)
+library(tidyverse)
+library(patchwork)
+library(RColorBrewer)
+gene_sets <- list(
+  M1_genes = c("IL12A", "IL23A", "IL12B", "TNF", "IL6", "CD86", "IL1B", "MARCO", 
+               "NOS2", "FCGR1A", "CD80", "IL23R", "CXCL9", "CXCL10", "CXCL11", 
+               "IL1A", "CCL5", "IRF5", "IRF1", "CD40", "IDO1", "KYNU", "CCR7"),
+  M2_genes = c("ARG1", "ARG2", "IL10", "FCGR2C", "CD163", "FCER2", "CD200R1", 
+               "PDCD1LG2", "CD274", "MARCO", "CSF1R", "MRC1", "IL1RN", "IL1R2", 
+               "IL4R", "CCL4", "CCL13", "CCL20", "CCL17", "CCL18", "CCL22", 
+               "CCL24", "LYVE1", "VEGFA", "VEGFB", "VEGFC", "VEGFD", "EGF", 
+               "CTSA", "CTSB", "CST3", "CTSD", "TGFB1", "TGFB2", "TGFB3", 
+               "MMP14", "MMP19", "MMP9", "CLEC7A", "WNT7B", "FASLG", "TNFSF12", 
+               "TNFSF8", "CD276", "VTCN1", "MSR1", "FN1", "IRF4"),
+  ICBs_genes = c("LAIR1", "SIRPA", "HAVCR2", "NECTIN2", "PVR", "CD274", 
+                 "ADORA2A", "IDO1", "BTLA")
+)
+
+for (module in names(gene_sets)) {
+  mac2 <- AddModuleScore(
+    object = mac2,
+    features = list(gene_sets[[module]]),
+    name = module
+  )
+}
+
+module_columns <- colnames(mac2@meta.data)[grep("1$", colnames(mac2@meta.data))]
+all_heatmap_data <- list()
+
+for (module in module_columns) {
+  
+  meta_data <- mac2@meta.data %>%
+    as_tibble() %>%
+    dplyr::select(small2, disease, !!rlang::sym(module))
+  colnames(meta_data)[3] <- "ModuleScore"
+  
+  heatmap_data <- meta_data %>%
+    group_by(small2, disease) %>%
+    summarise(ModuleScore = mean(ModuleScore, na.rm = TRUE), .groups = "drop")
+  
+  heatmap_data_wide <- pivot_wider(
+    heatmap_data, names_from = disease, values_from = ModuleScore, values_fill = list(ModuleScore = 0)
+  )
+  rownames(heatmap_data_wide) <- heatmap_data_wide$small2
+  original_small2 <- heatmap_data_wide$small2
+  heatmap_data_wide$small2 <- NULL
+  
+  mat <- as.matrix(heatmap_data_wide)
+  mat_scaled <- scale(as.vector(mat))
+  mat_scaled <- matrix(mat_scaled, nrow = nrow(mat), ncol = ncol(mat), byrow = FALSE)
+  rownames(mat_scaled) <- original_small2
+  colnames(mat_scaled) <- colnames(mat)
+  
+  heatmap_scaled <- as.data.frame(mat_scaled)
+  heatmap_scaled$small2 <- factor(rownames(heatmap_scaled), levels = original_small2)
+  
+  heatmap_data_long <- pivot_longer(
+    heatmap_scaled, -small2, names_to = "disease", values_to = "ModuleScore"
+  )
+  
+  heatmap_data_long$module <- module
+  all_heatmap_data[[module]] <- heatmap_data_long
+}
+
+all_module_df <- bind_rows(all_heatmap_data)
+
+sceobj <- sc.metabolism.Seurat(
+  obj = mac2,
+  method = "AUCell", 
+  imputation = FALSE, 
+  ncores = 4,
+  metabolism.type = "KEGG"
+)
+
+df <- as.data.frame(t(sceobj@assays[["METABOLISM"]][["score"]]))
+df$cell_type <- sceobj$small2
+df$disease <- sceobj$disease
+
+df_long <- df %>%
+  pivot_longer(cols = -c(cell_type, disease), names_to = "Pathway", values_to = "Score") %>%
+  group_by(cell_type, disease, Pathway) %>%
+  summarise(mean_Score = mean(Score, na.rm = TRUE), .groups = "drop")
+
+df_summary <- df_long %>%
+  group_by(cell_type, disease) %>%
+  summarise(metabolism_score = mean(mean_Score, na.rm = TRUE), .groups = "drop")
+
+
+df_summary$ScaledScore <- scale(df_summary$metabolism_score)[,1]
+
+
+metabolism_heat <- df_summary %>%
+  rename(small2 = cell_type, ModuleScore = ScaledScore) %>%
+  mutate(module = "Metabolism")
+
+combined_df <- bind_rows(all_module_df, metabolism_heat)
+ggplot(combined_df, aes(x = disease, y = small2, fill = ModuleScore)) +
+  geom_tile(color = "white", width = 0.9, height = 0.9) +
+  facet_wrap(~ module, nrow = 1, strip.position = "top") +  
+  scale_fill_gradient2(low = "navy", mid = "white", high = "firebrick3", midpoint = 0,
+                       name = "Z-score") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.spacing.x = unit(0.5, "lines"),
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    legend.position = "bottom"
+  )
